@@ -22,6 +22,8 @@
 
 #include <gst/gst.h>
 #include <gst/base/gstbasesink.h>
+#include <stdio.h>
+#include <glib/gstdio.h>
 
 G_BEGIN_DECLS
 
@@ -37,6 +39,10 @@ typedef struct _GstChecksumSinkClass GstChecksumSinkClass;
 struct _GstChecksumSink
 {
   GstBaseSink base_checksumsink;
+  gchar *filename;
+  FILE *fd;
+  gint status;
+  gboolean generate_hash;
   GChecksumType hash;
 };
 

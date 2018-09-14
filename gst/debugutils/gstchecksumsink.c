@@ -24,6 +24,17 @@
 #include <gst/gst.h>
 #include <gst/base/gstbasesink.h>
 #include "gstchecksumsink.h"
+#include <dirent.h>
+#include <string.h>
+
+/* properties */
+enum
+{
+  PROP_0,
+  PROP_HASH,
+  PROP_CHECKSUM_FILE,
+  PROP_STATUS
+};
 
 static void gst_checksum_sink_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec);
@@ -37,11 +48,18 @@ static gboolean gst_checksum_sink_stop (GstBaseSink * sink);
 static GstFlowReturn
 gst_checksum_sink_render (GstBaseSink * sink, GstBuffer * buffer);
 
-enum
+static void gst_checksum_sink_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec);
+static void gst_checksum_sink_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec);
+
+/* Template definition */
+
+/*enum
 {
   PROP_0,
   PROP_HASH,
-};
+};*/
 
 static GstStaticPadTemplate gst_checksum_sink_sink_template =
 GST_STATIC_PAD_TEMPLATE ("sink",
@@ -83,6 +101,13 @@ gst_checksum_sink_class_init (GstChecksumSinkClass * klass)
 
   gobject_class->set_property = gst_checksum_sink_set_property;
   gobject_class->get_property = gst_checksum_sink_get_property;
+  g_object_class_install_property (gobject_class, PROP_CHECKSUM_FILE,
+      g_param_spec_string ("checksum-file", "checksum-file", "checksum file name",
+          NULL, G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_STATUS,
+      g_param_spec_int ("status", "status", "status of checksum comparision",
+          -1, 9999999, 0, G_PARAM_READWRITE));
   gobject_class->dispose = gst_checksum_sink_dispose;
   gobject_class->finalize = gst_checksum_sink_finalize;
   base_sink_class->start = GST_DEBUG_FUNCPTR (gst_checksum_sink_start);
@@ -107,6 +132,8 @@ gst_checksum_sink_init (GstChecksumSink * checksumsink)
 {
   gst_base_sink_set_sync (GST_BASE_SINK (checksumsink), FALSE);
   checksumsink->hash = G_CHECKSUM_SHA1;
+  checksumsink->filename = malloc(sizeof(gchar) * 200);
+  checksumsink->status = 0;
 }
 
 static void
@@ -119,6 +146,9 @@ gst_checksum_sink_set_property (GObject * object, guint prop_id,
     case PROP_HASH:
       checksumsink->hash = g_value_get_enum (value);
       break;
+    case PROP_CHECKSUM_FILE:
+      strcpy(checksumsink->filename, g_value_get_string(value));
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -129,11 +159,17 @@ static void
 gst_checksum_sink_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec)
 {
-  GstChecksumSink *checksumsink = GST_CHECKSUM_SINK (object);
+  GstChecksumSink *filter = GST_CHECKSUM_SINK (object);
 
   switch (prop_id) {
     case PROP_HASH:
-      g_value_set_enum (value, checksumsink->hash);
+      g_value_set_enum (value, filter->hash);
+      break;
+    case PROP_CHECKSUM_FILE:
+      g_value_set_string (value, filter->filename);
+      break;
+    case PROP_STATUS:
+      g_value_set_int (value, filter->status);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -150,12 +186,40 @@ gst_checksum_sink_dispose (GObject * object)
 static void
 gst_checksum_sink_finalize (GObject * object)
 {
+  GstChecksumSink *sink1 = GST_CHECKSUM_SINK(object);
+  if(sink1->fd != NULL)
+    fclose(sink1->fd);
+
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
 static gboolean
 gst_checksum_sink_start (GstBaseSink * sink)
 {
+  struct stat stat1;
+
+  GstChecksumSink *sink1 = GST_CHECKSUM_SINK(sink);
+  memset((void *) &stat1, 0, sizeof(stat1));
+
+  if(sink1->fd != NULL)
+ {
+    fclose(sink1->fd);
+   sink1->fd = NULL;
+  }
+
+  if (stat(sink1->filename, &stat1) == -1 && errno == ENOENT) {
+    g_print("Missing checksum file: %s\nGenerating new checksum file... \n", sink1->filename);
+    sink1->fd = fopen(sink1->filename, "w");
+   if(sink1->fd == NULL)
+    {
+      g_print("can't open %s for writing! \n", sink1->filename);
+    }
+    sink1->generate_hash = 1;
+  } else {
+    sink1->fd = fopen(sink1->filename, "r");
+    sink1->generate_hash = 0;
+  }
+  sink1->status = 0;
   return TRUE;
 }
 
@@ -168,18 +232,45 @@ gst_checksum_sink_stop (GstBaseSink * sink)
 static GstFlowReturn
 gst_checksum_sink_render (GstBaseSink * sink, GstBuffer * buffer)
 {
-  gchar *s;
+  gchar *checksum = NULL, *r_hash = NULL;
   GstMapInfo map;
+  static int count = 0;
+  GstChecksumSink *sink1 = GST_CHECKSUM_SINK(sink);
   GstChecksumSink *checksumsink;
 
   checksumsink = GST_CHECKSUM_SINK (sink);
   gst_buffer_map (buffer, &map, GST_MAP_READ);
-  s = g_compute_checksum_for_data (checksumsink->hash, map.data, map.size);
+  checksum = g_compute_checksum_for_data (G_CHECKSUM_SHA1, map.data, map.size);
   gst_buffer_unmap (buffer, &map);
   g_print ("%" GST_TIME_FORMAT " %s\n",
-      GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buffer)), s);
+      GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buffer)), checksum);
+  g_print ("%d == > %s\n", count++, checksum);
+  checksum = g_strconcat(checksum, "\n", NULL);
 
-  g_free (s);
+ if(sink1->generate_hash == 1) {
+    fwrite(checksum, sizeof(char), strlen(checksum), sink1->fd);
+    fflush(sink1->fd);
+ } else {
+    r_hash = (char *) malloc(sizeof(char) * 100);
+    if( fgets(r_hash, 100, sink1->fd) != 0 ) {
+      if(! strstr(checksum, r_hash) ) {
+        if(!sink1->status)
+       {
+          g_print("Checksum mismatch at frame %d!\n", count++);
+          sink1->status++;
+       }
+      }
+    } else {
+      if(!sink1->status)
+     {
+        g_print("Error: Checksum file has only %d frames!\n", count - 1);
+        sink1->status++;
+      }
+    }
+   free(r_hash);
+  }
+
+  g_free (checksum);
 
   return GST_FLOW_OK;
 }
